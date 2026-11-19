@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>F-35 HUD — LIVE + CAM</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#000; touch-action:none;
+    font-family:'Courier New',monospace; user-select:none; -webkit-user-select:none; }
+  #hud { position:fixed; inset:0; display:block; z-index:2; }
+  #cam { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; z-index:1;
+    display:none; transform:scaleX(-1); }
+  #cam.rear { transform:none; }
+  #startOverlay { position:fixed; inset:0; background:#000; z-index:10;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:22px;
+    color:#39ff6a; font-family:'Courier New',monospace; }
+  #startOverlay h1 { font-size:22px; letter-spacing:6px; font-weight:normal; }
+  #startOverlay p { font-size:13px; color:#2affd5; opacity:.85; text-align:center; padding:0 30px; line-height:1.9; }
+  #startBtn { background:transparent; border:2px solid #39ff6a; color:#39ff6a;
+    padding:16px 44px; font-size:17px; letter-spacing:4px; font-family:inherit;
+    border-radius:4px; cursor:pointer; animation:pulse 1.6s infinite; }
+  #startBtn:active { background:#39ff6a; color:#000; }
+  #startBtn:disabled { opacity:.35; animation:none; }
+  @keyframes pulse { 0%,100%{box-shadow:0 0 8px #39ff6a55;} 50%{box-shadow:0 0 24px #39ff6aaa;} }
+  #statusBox { position:fixed; top:calc(8px + env(safe-area-inset-top)); left:10px; z-index:5;
+    color:#39ff6a; font-size:10px; letter-spacing:1px; line-height:1.7; opacity:.85;
+    font-family:'Courier New',monospace; pointer-events:none; }
+  #statusBox .off { color:#ff5555; }
+  #statusBox .on  { color:#3dff6e; }
+  #flipBtn { position:fixed; bottom:calc(16px + env(safe-area-inset-bottom)); right:16px; z-index:6;
+    background:rgba(0,20,0,.5); border:1.5px solid #39ff6a; color:#39ff6a; border-radius:50%;
+    width:52px; height:52px; font-size:22px; display:none; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="hud"></canvas>
+
+<div id="startOverlay">
+  <h1>F-35 HUD</h1>
+  <p>اتصال زنده به سنسورها + دوربین آیفون<br>
+  ژیروسکوپ + شتاب‌سنج + قطب‌نما + دوربین<br>
+  <span style="color:#ffaa33">حتماً با Safari باز کنید — اتصال HTTPS لازم است</span></p>
+  <button id="startBtn">فعال‌سازی سنسورها و دوربین</button>
+</div>
+
+<div id="statusBox">
+  <div id="stGyro">GYRO  <span class="off">—</span></div>
+  <div id="stAcc"> ACCEL <span class="off">—</span></div>
+  <div id="stMag"> MAG   <span class="off">—</span></div>
+  <div id="stCam"> CAM   <span class="off">—</span></div>
+  <div id="stRate">RATE  <span class="off">0 Hz</span></div>
+</div>
+<button id="flipBtn">⟲</button>
+
+<script>
+const cvs = document.getElementById('hud');
+const ctx = cvs.getContext('2d');
+const cam = document.getElementById('cam');
+const $ = id => document.getElementById(id);
+let W, H, CX, CY;
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio||1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cvs.width = W*dpr; cvs.height = H*dpr;
+  cvs.style.width = W+'px'; cvs.style.height = H+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  CX = W/2; CY = H/2;
+}
+resize();
+addEventListener('resize', resize);
+addEventListener('orientationchange', ()=>setTimeout(resize,250));
+
+/* ================= CAMERA ================= */
+let camOn=false, useRear=true;
+async function startCamera(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode: useRear?'environment':'user',
+              width:{ideal:1920}, height:{ideal:1080} },
+      audio:false
+    });
+    cam.srcObject = stream;
+    await cam.play();
+    cam.style.display='block';
+    cam.classList.toggle('rear', useRear);
+    camOn=true;
+    $('stCam').innerHTML='CAM   <span class="on">● '+ (useRear?'REAR':'FRONT') +'</span>';
+    $('flipBtn').style.display='block';
+  }catch(err){
+    $('stCam').innerHTML='CAM   <span class="off">DENIED</span>';
+  }
+}
+$('flipBtn').addEventListener('click', async ()=>{
+  useRear=!useRear;
+  if (cam.srcObject) cam.srcObject.getTracks().forEach(t=>t.stop());
+  camOn=false;
+  await startCamera();
+});
+
+/* ================= SENSOR FUSION ================= */
+const S = {
+  live:false, lastData:0,
+  pitch:0, roll:0, hdg:0,
+  ax:0, ay:0, az:9.8,
+  gx:0, gy:0, gz:0,
+  compass:null, orientAlpha:null,
+  hz:0, frames:0, hzT:0
+};
+
+function mapAngles(){
+  return (screen.orientation && typeof screen.orientation.angle==='number')
+          ? screen.orientation.angle : (window.orientation||0);
+}
+
+let fPitch=null, fRoll=null, lastT=null;
+function fuse(dt){
+  const ax=S.ax, ay=S.ay, az=S.az;
+  const ang = mapAngles();
+  let pAcc, rAcc, pRate, rRate;
+  if (ang===0 || ang===180){
+    pAcc = Math.atan2(-ax, Math.sqrt(ay*ay+az*az));
+    rAcc = Math.atan2( ay, az );
+    pRate =  S.gy;  rRate = -S.gx;
+    if (ang===180){ pRate=-pRate; rRate=-rRate; }
+  } else {
+    pAcc = Math.atan2(-ay, Math.sqrt(ax*ax+az*az));
+    rAcc = Math.atan2( ax, az );
+    pRate =  S.gx;  rRate = -S.gy;
+  }
+  if (fPitch===null){ fPitch=pAcc; fRoll=rAcc; }
+  const kG = 0.96;
+  fPitch = kG*(fPitch + pRate*dt) + (1-kG)*pAcc;
+  fRoll  = kG*(fRoll  + rRate*dt) + (1-kG)*rAcc;
+  S.pitch = -fPitch*180/Math.PI;
+  S.roll  =  fRoll*180/Math.PI;
+  S.roll  = (ang===90||ang===-90) ? -S.roll : S.roll;
+}
+
+let motionOK=false, orientOK=false;
+addEventListener('devicemotion', e=>{
+  if (!e.accelerationIncludingGravity) return;
+  motionOK=true; S.lastData=performance.now();
+  const a=e.accelerationIncludingGravity;
+  S.ax=a.x||0; S.ay=a.y||0; S.az=a.z||0;
+  if (e.rotationRate){ S.gx=e.rotationRate.alpha||0; S.gy=e.rotationRate.beta||0; S.gz=e.rotationRate.gamma||0; }
+  const now=performance.now();
+  if (lastT===null) lastT=now;
+  fuse(Math.min(0.1,(now-lastT)/1000)); lastT=now;
+  S.frames++;
+  if (now-S.hzT>1000){ S.hz=S.frames; S.frames=0; S.hzT=now;
+    $('stRate').innerHTML='RATE  <span class="on">'+S.hz+' Hz</span>'; }
+  $('stGyro').innerHTML='GYRO  <span class="on">●</span>';
+  $('stAcc').innerHTML ='ACCEL <span class="on">●</span>';
+});
+addEventListener('deviceorientation', e=>{
+  if (e.alpha===null && e.webkitCompassHeading===undefined) return;
+  orientOK=true; S.lastData=performance.now();
+  if (typeof e.webkitCompassHeading==='number') S.compass=e.webkitCompassHeading;
+  else if (e.alpha!==null) S.orientAlpha=e.alpha;
+  $('stMag').innerHTML='MAG   <span class="on">●</span>';
+});
+
+function updateHeading(dt){
+  let target=null;
+  if (S.compass!==null) target=S.compass;
+  else if (S.orientAlpha!==null) target=(360-S.orientAlpha)%360;
+  if (target===null) return;
+  let d=target-S.hdg;
+  while(d>180)d-=360; while(d<-180)d+=360;
+  S.hdg=(S.hdg + d*Math.min(1,dt*6) + 360)%360;
+}
+
+/* ---------- start ---------- */
+$('startBtn').addEventListener('click', async ()=>{
+  const btn=$('startBtn'); btn.disabled=true; btn.textContent='در حال اتصال…';
+  try{
+    if (typeof DeviceOrientationEvent!=='undefined' &&
+        typeof DeviceOrientationEvent.requestPermission==='function'){
+      const r1=await DeviceOrientationEvent.requestPermission();
+      const r2=(typeof DeviceMotionEvent!=='undefined' &&
+                typeof DeviceMotionEvent.requestPermission==='function')
+               ? await DeviceMotionEvent.requestPermission() : 'granted';
+      if (r1!=='granted' && r2!=='granted') throw 0;
+    }
+  }catch(err){ btn.disabled=false; btn.textContent='تلاش مجدد'; return; }
+  startCamera();                       // camera runs independently
+  setTimeout(()=>{
+    if (motionOK||orientOK){
+      S.live=true;
+      $('startOverlay').style.display='none';
+      document.documentElement.requestFullscreen?.().catch(()=>{});
+      screen.orientation?.lock?.('landscape').catch(()=>{});
+    } else {
+      btn.disabled=false;
+      btn.textContent='سنسور پیدا نشد — Safari + HTTPS؟';
+    }
+  },1500);
+});
+
+/* ================= DRAWING ================= */
+const GRN='#3dff6e', CYN='#2affd5', RED='#ff4444';
+function txt(s,x,y,size=15,color=GRN,align='center',alpha=1){
+  ctx.globalAlpha=alpha; ctx.fillStyle=color;
+  ctx.font='bold '+size+'px "Courier New",monospace';
+  ctx.textAlign=align; ctx.textBaseline='middle';
+  ctx.shadowColor=color; ctx.shadowBlur=6;
+  ctx.fillText(s,x,y); ctx.shadowBlur=0; ctx.globalAlpha=1;
+}
+function line(x1,y1,x2,y2,color=GRN,lw=2,alpha=1){
+  ctx.globalAlpha=alpha; ctx.strokeStyle=color; ctx.lineWidth=lw;
+  ctx.shadowColor=color; ctx.shadowBlur=4;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.shadowBlur=0; ctx.globalAlpha=1;
+}
+function circle(x,y,r,color=GRN,lw=2,alpha=1){
+  ctx.globalAlpha=alpha; ctx.strokeStyle=color; ctx.lineWidth=lw;
+  ctx.shadowColor=color; ctx.shadowBlur=4;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.stroke();
+  ctx.shadowBlur=0; ctx.globalAlpha=1;
+}
+
+function drawHorizon(pitchDeg, rollDeg){
+  const pxPerDeg=Math.min(W,H)/55;
+  ctx.save();
+  ctx.translate(CX,CY);
+  ctx.rotate(rollDeg*Math.PI/180);
+  ctx.translate(0,-pitchDeg*pxPerDeg);
+  const R=Math.max(W,H)*1.6;
+  /* translucent sky/ground tint over camera */
+  ctx.fillStyle='rgba(20,60,120,0.30)'; ctx.fillRect(-R,-R,R*2,R);
+  ctx.fillStyle='rgba(80,50,15,0.30)';  ctx.fillRect(-R,0,R*2,R);
+  line(-R,0,R,0,GRN,2.5,.95);
+  for(let d=-30;d<=30;d+=5){
+    if(d===0) continue;
+    const y=-d*pxPerDeg, w=(Math.abs(d)%10===0)?90:45;
+    line(-w,y,w,y,GRN,Math.abs(d)%10===0?2.5:1.5,.85);
+    if(Math.abs(d)%10===0){
+      txt(Math.abs(d),-w-18,y,13,GRN,'right',.85);
+      txt(Math.abs(d), w+18,y,13,GRN,'left', .85);
+    }
+  }
+  ctx.restore();
+}
+function drawTape(x,y,value,unitStep,bigEvery,label,dir){
+  const th=190, half=th/2;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x-46,y-half,92,th); ctx.clip();
+  const pxPerUnit=th/(unitStep*8), off=(value%unitStep)*pxPerUnit;
+  for(let i=-8;i<=8;i++){
+    const v=Math.round(value/unitStep)*unitStep+i*unitStep;
+    const yy=y+i*unitStep*pxPerUnit-off;
+    if(v<0) continue;
+    const big=v%bigEvery===0;
+    line(x-40*dir,yy,x-(40-(big?30:15))*dir,yy,GRN,big?2.5:1.5,.8);
+    if(big) txt(String(v),x-(95*dir),yy,14,GRN,dir>0?'right':'left',.95);
+  }
+  ctx.restore();
+  line(x-50,y-half-8,x+50,y-half-8,GRN,2,.85);
+  line(x-50,y+half+8,x+50,y+half+8,GRN,2,.85);
+  ctx.fillStyle=GRN; ctx.shadowColor=GRN; ctx.shadowBlur=6;
+  ctx.beginPath();
+  if(dir>0){ctx.moveTo(x-62,y);ctx.lineTo(x-48,y-8);ctx.lineTo(x-48,y+8);}
+  else{ctx.moveTo(x+62,y);ctx.lineTo(x+48,y-8);ctx.lineTo(x+48,y+8);}
+  ctx.closePath(); ctx.fill(); ctx.shadowBlur=0;
+  txt(Math.round(value),x,y,19,GRN);
+  txt(label,x,y+half+26,12,GRN,'center',.75);
+}
+function drawHeadingTape(hdg){
+  const y=46, half=W*0.42;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(CX-half,y-18,half*2,36); ctx.clip();
+  const pxPerDeg=3.2, off=(hdg%5)*pxPerDeg;
+  for(let i=-60;i<=60;i++){
+    const v=((Math.round(hdg/5)*5+i*5)%360+360)%360;
+    const xx=CX+i*5*pxPerDeg-off;
+    if(xx<CX-half||xx>CX+half) continue;
+    const big=v%30===0;
+    line(xx,y+(big?0:8),xx,y+16,GRN,big?2.5:1.5,.85);
+    if(big){
+      const lbl=v===0?'N':v===90?'E':v===180?'S':v===270?'W':String(v/10);
+      txt(lbl,xx,y-9,14,v%90===0?CYN:GRN,'center',.95);
+    }
+  }
+  ctx.restore();
+  line(CX-half,y+18,CX+half,y+18,GRN,2,.85);
+  ctx.fillStyle=CYN; ctx.shadowColor=CYN; ctx.shadowBlur=8;
+  ctx.beginPath(); ctx.moveTo(CX,y+20);ctx.lineTo(CX-7,y+32);ctx.lineTo(CX+7,y+32);
+  ctx.closePath(); ctx.fill(); ctx.shadowBlur=0;
+  txt(String(Math.round(hdg)).padStart(3,'0'),CX,y+42,17,CYN);
+}
+function drawGunCross(){
+  const y=CY-Math.min(W,H)*0.06;
+  line(CX-70,y,CX-26,y,GRN,3); line(CX+26,y,CX+70,y,GRN,3);
+  line(CX-6,y-6,CX+6,y+6,GRN,2.5); line(CX-6,y+6,CX+6,y-6,GRN,2.5);
+  circle(CX,y,3,GRN,2);
+}
+function drawAoa(aoa){
+  const x=CX+Math.min(W,H)*0.31, y=CY;
+  const aoaY=Math.max(-60,Math.min(60,aoa*8));
+  line(x,y-70,x,y+70,GRN,2,.55);
+  for(const s of [-45,0,45]) line(x,y+s,x+14,y+s,GRN,2,.85);
+  ctx.fillStyle=GRN; ctx.shadowColor=GRN; ctx.shadowBlur=6;
+  ctx.beginPath(); ctx.moveTo(x+16,y-aoaY); ctx.lineTo(x+26,y-aoaY-7);
+  ctx.lineTo(x+26,y-aoaY+7); ctx.closePath(); ctx.fill(); ctx.shadowBlur=0;
+  txt('AOA',x+22,y-92,11,GRN,'center',.65);
+}
+function drawFpv(pitch){
+  const pxPerDeg=Math.min(W,H)/55;
+  const y=CY-(pitch+3)*pxPerDeg;
+  const yy=Math.max(CY-120,Math.min(CY+120,y));
+  circle(CX,yy,9,CYN,2.5);
+  line(CX-16,yy,CX-6,yy,CYN,2.5); line(CX+6,yy,CX+16,yy,CYN,2.5);
+  line(CX,yy+9,CX,yy+22,CYN,2.5);
+}
+
+/* ---------- main loop ---------- */
+let smP=0, smR=0, smH=0, lastLoop=performance.now();
+function loop(now){
+  const dt=Math.min(0.05,(now-lastLoop)/1000); lastLoop=now;
+  updateHeading(dt);
+  smP+=(S.pitch-smP)*0.18; smR+=(S.roll-smR)*0.18; smH+=(S.hdg-smH)*0.15;
+
+  const spd=240+40*Math.sin(now/4000);
+  const alt=15000+600*Math.sin(now/6000);
+  const aoa=2+3*Math.sin(now/3000);
+  const mach=spd/660, gForce=1+Math.abs(smR)/60;
+
+  ctx.clearRect(0,0,W,H);
+  drawHorizon(smP,smR);
+  drawHeadingTape(smH);
+  const tapY=CY+10;
+  drawTape(74,tapY,spd,10,50,'SPD',1);
+  drawTape(W-74,tapY,alt,100,500,'ALT',-1);
+  drawGunCross();
+  drawFpv(smP);
+  drawAoa(aoa);
+  txt('M '+mach.toFixed(2), W-26, H*0.24, 15, CYN,'right',.95);
+  txt(gForce.toFixed(1)+' G', W-26, H*0.24+24, 15, CYN,'right',.95);
+  txt('F-35  ▲  AA', CX, H-46, 13, GRN,'center',.65);
+  txt('MASTER ARM', 90, H*0.14, 12, RED,'center',.85);
+
+  if (S.live && now-S.lastData>1500) txt('SENSOR LINK LOST', CX, 100, 16, RED);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
